@@ -1,50 +1,63 @@
-#include <Arduino.h>
+#include <Wire.h> 
+#include <Arduino.h> 
+#include <LiquidCrystal_I2C.h>
 
-// Joystick Pins
-const int pinX = A0;
-const int pinY = A1;
-const int pinSW = 2;
+const int soundAnalogPin = A0;
+const int soundDigitalPin = 2; 
+const int ledPin = 13;
 
-// LED Pins
-const int LED_RIGHT = 8;
-const int LED_LEFT = 9;
-const int LED_UP = 10;
-const int LED_DOWN = 11;
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+// Non-blocking timing variables
+unsigned long previousMillis = 0;
+const long updateInterval = 100; 
+
+volatile bool thresholdTriggered = false; 
+unsigned long ledTurnOnTime = 0;
+const long ledDuration = 500; // Keep LED on for 500ms after a loud noise
 
 void setup() {
-  pinMode(LED_RIGHT, OUTPUT);
-  pinMode(LED_LEFT, OUTPUT);
-  pinMode(LED_UP, OUTPUT);
-  pinMode(LED_DOWN, OUTPUT);
   Serial.begin(9600);
+  pinMode(ledPin, OUTPUT);
+  pinMode(soundDigitalPin, INPUT);
+
+  lcd.init();
+  lcd.backlight();
+
+  attachInterrupt(digitalPinToInterrupt(soundDigitalPin), soundISR, RISING);
 }
 
 void loop() {
-  int xVal = analogRead(pinX);
-  int yVal = analogRead(pinY);
-  int swVal = digitalRead(pinSW);
-  
-  float voltX = (xVal * 5.0) / 1023.0;
-  float voltY = (yVal * 5.0) / 1023.0;
+  unsigned long currentMillis = millis();
 
-  bool r = (voltX < 1.0); 
-  bool l = (voltX > 4.0); 
-  bool u = (voltY > 4.0); 
-  bool d = (voltY < 1.0); 
+  if (currentMillis - previousMillis >= updateInterval) {
+    previousMillis = currentMillis;
+    int soundLevel = analogRead(soundAnalogPin);
 
-  digitalWrite(LED_RIGHT, r);
-  digitalWrite(LED_LEFT, l);
-  digitalWrite(LED_UP, u);
-  digitalWrite(LED_DOWN, d);
+    lcd.setCursor(0, 0);
+    lcd.print("Sound Lvl: ");
+    lcd.print(soundLevel);
+    lcd.print("    "); 
 
-  // Telemetry Format: X:v,Y:v,B:s,R:0/1,L:0/1,U:0/1,D:0/1
-  Serial.print("X:"); Serial.print(voltX, 2);
-  Serial.print(",Y:"); Serial.print(voltY, 2);
-  Serial.print(",B:"); Serial.print(swVal == LOW ? "PRSD" : "RLSD");
-  Serial.print(",R:"); Serial.print(r);
-  Serial.print(",L:"); Serial.print(l);
-  Serial.print(",U:"); Serial.print(u);
-  Serial.print(",D:"); Serial.println(d);
+    // Format: "SoundLevel,ThresholdState" 
+    Serial.print(soundLevel);
+    Serial.print(",");
+    Serial.println(thresholdTriggered ? 1 : 0);
+  }
 
-  delay(40); 
+  if (thresholdTriggered) {
+    digitalWrite(ledPin, HIGH);
+    ledTurnOnTime = currentMillis;
+    thresholdTriggered = false; // Reset the flag so it doesn't stay stuck
+  }
+
+  // Turn LED off if the duration has passed
+  if (digitalRead(ledPin) == HIGH && (currentMillis - ledTurnOnTime >= ledDuration)) {
+    digitalWrite(ledPin, LOW);
+  }
+}
+
+// The Interrupt Service Routine 
+void soundISR() {
+  thresholdTriggered = true;
 }
