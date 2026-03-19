@@ -1,63 +1,76 @@
-#include <Wire.h> 
-#include <Arduino.h> 
-#include <LiquidCrystal_I2C.h>
+#include <Arduino.h>
+#include <LiquidCrystal.h>
 
-const int soundAnalogPin = A0;
-const int soundDigitalPin = 2; 
-const int ledPin = 13;
+// --- Pin Definitions ---
+const int contrastPin = 6;      
+const int rs = 7, en = 8, d4 = 9, d5 = 10, d6 = 11, d7 = 12; 
+const int soundAnalogPin = A0;  
+const int interruptPin = 2;     // Digital pin 2 for Hardware Interrupt
+const int ledPin = 13;          
 
-LiquidCrystal_I2C lcd(0x27, 16, 2);
+LiquidCrystal lcd(rs, en, d4, d5, d6, d7);
 
-// Non-blocking timing variables
-unsigned long previousMillis = 0;
-const long updateInterval = 100; 
+// --- Non-Blocking Variables ---
+unsigned long previousMillis = 0;   
+const long updateInterval = 50;  
 
-volatile bool thresholdTriggered = false; 
-unsigned long ledTurnOnTime = 0;
-const long ledDuration = 500; // Keep LED on for 500ms after a loud noise
+unsigned long ledTriggeredMillis = 0; 
+const long ledOnDuration = 500;       
+
+// Volatile flag for the interrupt
+volatile bool soundSpikeDetected = false; 
+
+// --- Interrupt Service Routine ---
+void triggerLED() {
+  soundSpikeDetected = true; 
+}
 
 void setup() {
-  Serial.begin(9600);
+  Serial.begin(115200);
+
   pinMode(ledPin, OUTPUT);
-  pinMode(soundDigitalPin, INPUT);
+  pinMode(contrastPin, OUTPUT);
+  pinMode(interruptPin, INPUT);
 
-  lcd.init();
-  lcd.backlight();
+  lcd.begin(16, 2);
+  lcd.clear();          // Wipes any random garbage currently in the LCD's memory
+  lcd.setCursor(0, 0);  // Start at the top-left
 
-  attachInterrupt(digitalPinToInterrupt(soundDigitalPin), soundISR, RISING);
+  attachInterrupt(digitalPinToInterrupt(interruptPin), triggerLED, RISING);
 }
 
 void loop() {
   unsigned long currentMillis = millis();
+  int interruptOccurred = 0; // Flag to send to Python
 
+  // 1. Handle the Interrupt Event 
+  if (soundSpikeDetected) {
+    digitalWrite(ledPin, HIGH);        
+    ledTriggeredMillis = currentMillis; 
+    soundSpikeDetected = false;        
+    interruptOccurred = 1; //a spike happened
+  }
+
+  // Turn off LED after duration
+  if (digitalRead(ledPin) == HIGH && (currentMillis - ledTriggeredMillis >= ledOnDuration)) {
+    digitalWrite(ledPin, LOW); 
+  } 
+
+  // 2. LCD and UART Updates (Non-Blocking)
   if (currentMillis - previousMillis >= updateInterval) {
-    previousMillis = currentMillis;
+    previousMillis = currentMillis; 
+    
     int soundLevel = analogRead(soundAnalogPin);
 
-    lcd.setCursor(0, 0);
-    lcd.print("Sound Lvl: ");
-    lcd.print(soundLevel);
-    lcd.print("    "); 
+    // Update LCD
+    lcd.setCursor(0, 1);       // Move to the bottom-left
+    lcd.print("Val: ");        
+    lcd.print(soundLevel);     
+    lcd.print("          ");   // Print 10 blank spaces
 
-    // Format: "SoundLevel,ThresholdState" 
+    // Send data over UART for your Python GUI
     Serial.print(soundLevel);
     Serial.print(",");
-    Serial.println(thresholdTriggered ? 1 : 0);
+    Serial.println(interruptOccurred);
   }
-
-  if (thresholdTriggered) {
-    digitalWrite(ledPin, HIGH);
-    ledTurnOnTime = currentMillis;
-    thresholdTriggered = false; // Reset the flag so it doesn't stay stuck
-  }
-
-  // Turn LED off if the duration has passed
-  if (digitalRead(ledPin) == HIGH && (currentMillis - ledTurnOnTime >= ledDuration)) {
-    digitalWrite(ledPin, LOW);
-  }
-}
-
-// The Interrupt Service Routine 
-void soundISR() {
-  thresholdTriggered = true;
 }
