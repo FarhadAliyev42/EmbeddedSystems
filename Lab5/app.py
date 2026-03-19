@@ -1,73 +1,86 @@
 import serial
-import time
-import csv
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 from datetime import datetime
+import csv
+import sys
+import math
 
-SERIAL_PORT = '/dev/cu.usbmodem14101' 
-BAUD_RATE = 9600
-LOG_FILE = 'threshold_exceeded_log.csv'
+# --- Configuration ---
+SERIAL_PORT = '/dev/cu.usbmodem1101' 
+BAUD_RATE = 115200; 
+LOG_FILE = "exceeded_thresholds_log.csv"
 
-# Setup Serial Connection
+# Set this to wherever you want the visual red line to appear!
+THRESHOLD_DB = 80.0  
+
+# --- Connect to Arduino ---
 try:
     ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
-    time.sleep(2) # Allow Arduino to reset
 except Exception as e:
-    print(f"Error: {e}")
-    exit()
+    print(f"Error connecting to {SERIAL_PORT}: {e}")
+    sys.exit()
 
-# Setup Data plotting
+# --- Setup Visualization ---
 x_data, y_data = [], []
 fig, ax = plt.subplots()
-line, = ax.plot([], [], lw=2, color='blue')
-ax.set_ylim(0, 1024)
-ax.set_xlim(0, 100)
-ax.set_title("Live Sound Level Visualization")
-ax.set_ylabel("Analog Value")
-ax.set_xlabel("Time")
+line, = ax.plot(x_data, y_data, color='blue', linewidth=2)
 
-# Initialize CSV Log
-with open(LOG_FILE, mode='w', newline='') as file:
+ax.set_title("Real-Time Sound Level (Decibels)")
+ax.set_ylabel("Level (dB)")
+ax.set_xlabel("Time (Samples)")
+
+# Initialize CSV log file with headers
+with open(LOG_FILE, "a", newline='') as file:
     writer = csv.writer(file)
-    writer.writerow(["Timestamp", "Sound Level"])
+    file.seek(0, 2)
+    if file.tell() == 0:
+        writer.writerow(["Timestamp", "Sound Level (dB)"])
 
-def update_plot(frame):
-    if ser.in_waiting > 0:
-        try:
+def update_graph(frame):
+    try:
+        line_data = None
+        
+        while ser.in_waiting > 0:
             line_data = ser.readline().decode('utf-8').strip()
-            if ',' in line_data:
-                sound_val_str, threshold_str = line_data.split(',')
-                sound_val = int(sound_val_str)
-                is_triggered = int(threshold_str)
-
-                # Append data for visualization
-                x_data.append(len(x_data))
-                y_data.append(sound_val)
-                
-                # Keep list sizes manageable
-                if len(x_data) > 100:
-                    x_data.pop(0)
-                    y_data.pop(0)
-                    ax.set_xlim(x_data[0], x_data[-1])
-
-                line.set_data(x_data, y_data)
-
-                # Visual indicator: change line color to red if high
-                line.set_color('red' if sound_val > 600 else 'blue')
-
-                # Log ONLY if threshold was exceeded (Triggered by ISR)
-                if is_triggered == 1:
-                    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
-                    with open(LOG_FILE, mode='a', newline='') as file:
-                        writer = csv.writer(file)
-                        writer.writerow([timestamp, sound_val])
-                    print(f"Logged Threshold Event: {timestamp} | Level: {sound_val}")
-
-        except ValueError:
-            pass # Ignore corrupted serial lines
             
+        if line_data and ";" in line_data:
+            sound_str, interrupt_str = line_data.split(",")
+            raw_value = int(sound_str)
+            interrupt_flag = int(interrupt_str)
+
+            if raw_value > 0:
+                db_level = (20 * math.log10(raw_value)) * 1.5
+            else:
+                db_level = 30.0
+
+            x_data.append(frame)
+            y_data.append(db_level)
+
+            if len(x_data) > 100:
+                x_data.pop(0)
+                y_data.pop(0)
+
+            line.set_data(x_data, y_data)
+            
+            ax.set_xlim(min(x_data), max(x_data) + 1)
+            current_max_y = max(y_data)
+            ax.set_ylim(0, max(120, current_max_y + 10))
+
+            if interrupt_flag == 1:
+                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                with open(LOG_FILE, "a", newline='') as file:
+                    writer = csv.writer(file)
+                    writer.writerow([timestamp, f"{db_level:.2f} dB"])
+            else:
+                line.set_color('blue')
+
+    except Exception as e:
+        pass
     return line,
 
-ani = animation.FuncAnimation(fig, update_plot, interval=50, blit=False)
+ani = animation.FuncAnimation(fig, update_graph, frames=range(100000), interval=50, blit=False)
+
 plt.show()
+
+ser.close()
