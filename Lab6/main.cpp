@@ -288,9 +288,8 @@ void loop() {
         cdNextBeep = millis() + 1000;
 
         if (cdRemain <= 0) {
-          // BUZZ — snapshot button states then fire
-          // Take snapshot before turning buzzer on
-          // (buzzer power surge can glitch nearby pins)
+          // Snapshot button states BEFORE making any sound
+          // (power surge from buzzer can glitch nearby pins)
           b1.wasHigh = (digitalRead(BTN1_PIN) == HIGH);
           b2.wasHigh = (digitalRead(BTN2_PIN) == HIGH);
           b1.fired = b2.fired = false;
@@ -298,9 +297,14 @@ void loop() {
           p1RT = p2RT = -1;
           p1Fired = p2Fired = false;
 
-          // NOW fire buzzer — stays on until button pressed or timeout
+          tone(BUZZER_PIN, 1200); delay(120);   // low-ish tone
+          noTone(BUZZER_PIN);     delay(40);    // tiny gap
+          tone(BUZZER_PIN, 2400); delay(160);   // higher tone — "GO!"
+          noTone(BUZZER_PIN);
+
+          // NOW start continuous buzz for react phase
           digitalWrite(BUZZER_PIN, HIGH);
-          buzzerOffAt = 0;   // manual control during react phase
+          buzzerOffAt = 0;
           buzzAt    = millis();
           gameState = ST_REACT;
           Serial.println("BUZZ");
