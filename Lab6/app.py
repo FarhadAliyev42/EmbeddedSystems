@@ -15,7 +15,6 @@ Run:      python app.py
 
 import sys, os, csv, glob, statistics
 from datetime import datetime
-from collections import defaultdict
 
 import serial
 import serial.tools.list_ports
@@ -23,15 +22,12 @@ import serial.tools.list_ports
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QGridLayout, QLabel, QPushButton, QLineEdit, QComboBox,
-    QTabWidget, QGroupBox, QScrollArea, QSizePolicy, QMessageBox
+    QTabWidget, QGroupBox, QScrollArea, QMessageBox
 )
 from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal, QObject
 from PyQt6.QtGui  import QFont
 
-import matplotlib
-matplotlib.use("QtAgg")
-from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
-from matplotlib.figure import Figure
+
 
 # ─────────────────────────────────────────────
 #  PATHS
@@ -109,37 +105,93 @@ QLabel {{ background: transparent; }}
 """
 
 # ─────────────────────────────────────────────
-#  CSV HELPERS
+#  DATA LAYER
+#
+#  Storage is per MATCHUP not per player.
+#  Files:
+#    alice_vs_bob.csv   — one row per completed game for this pairing
+#
+#  Matchup key is always alphabetically sorted so
+#  alice_vs_bob == bob_vs_alice (same file).
+#
+#  Score rules:
+#    Winner of a game  → +1
+#    Loser  of a game  → -1  (never below 0)
+#
+#  Scores are calculated fresh from the CSV every time —
+#  no separate JSON file needed.
 # ─────────────────────────────────────────────
-HEADERS = ["timestamp","opponent","round","reaction_ms",
-           "result","player_wins","opp_wins","session_id"]
+HEADERS = ["timestamp", "game_num", "winner",
+           "p1_reaction_ms", "p2_reaction_ms", "session_id"]
 
-def _file(name: str) -> str:
-    safe = "".join(c for c in name if c.isalnum() or c in "-_").lower()
-    return os.path.join(DATA_DIR, f"{safe}.csv")
+def _safe(name: str) -> str:
+    """Clean a name so it is safe to use in a filename."""
+    return "".join(c for c in name if c.isalnum() or c in "-_").lower()
 
-def save_round(player, opponent, rnd, reaction_ms, result, pw, ow, sid):
-    path   = _file(player)
+def _matchup_key(a: str, b: str) -> str:
+    """Always returns names in alphabetical order so A vs B == B vs A."""
+    pair = sorted([_safe(a), _safe(b)])
+    return f"{pair[0]}_vs_{pair[1]}"
+
+def _csv_path(a: str, b: str) -> str:
+    return os.path.join(DATA_DIR, f"{_matchup_key(a, b)}.csv")
+
+# ── GAME HISTORY ──────────────────────────────
+def save_game(a: str, b: str, winner_name: str,
+              p1_rt: int, p2_rt: int, session_id: str):
+    """Append one completed game to the matchup CSV."""
+    path   = _csv_path(a, b)
     is_new = not os.path.exists(path)
+    game_num = 1
+    if not is_new:
+        with open(path, newline="") as f:
+            game_num = sum(1 for _ in csv.reader(f))  # count rows incl. header
     with open(path, "a", newline="") as f:
         w = csv.writer(f)
         if is_new:
             w.writerow(HEADERS)
         w.writerow([datetime.now().isoformat(timespec="seconds"),
-                    opponent, rnd, reaction_ms, result, pw, ow, sid])
+                    game_num, winner_name, p1_rt, p2_rt, session_id])
 
-def load_player(name: str) -> list[dict]:
-    path = _file(name)
+def load_matchup(a: str, b: str) -> list[dict]:
+    """Load full game history for this matchup."""
+    path = _csv_path(a, b)
     if not os.path.exists(path):
         return []
     with open(path, newline="") as f:
         return list(csv.DictReader(f))
 
-def known_players() -> list[str]:
-    return sorted(
-        os.path.splitext(os.path.basename(f))[0].capitalize()
-        for f in glob.glob(os.path.join(DATA_DIR, "*.csv"))
-    )
+def calc_scores(a: str, b: str) -> tuple[int, int]:
+    """
+    Calculate persistent scores directly from the CSV.
+    Replay every game in order: winner +1, loser -1 (floor 0).
+    Returns (a_score, b_score).
+    """
+    games   = load_matchup(a, b)
+    a_score = 0
+    b_score = 0
+    for g in games:
+        winner = g.get("winner", "").strip().lower()
+        if winner == a.lower():
+            a_score += 1
+            b_score = max(0, b_score - 1)
+        elif winner == b.lower():
+            b_score += 1
+            a_score = max(0, a_score - 1)
+    return a_score, b_score
+
+def known_matchups() -> list[str]:
+    """Return list of all matchup names from existing CSV files."""
+    files = glob.glob(os.path.join(DATA_DIR, "*_vs_*.csv"))
+    names = []
+    for f in files:
+        base = os.path.splitext(os.path.basename(f))[0]
+        parts = base.split("_vs_")
+        if len(parts) == 2:
+            names.append(f"{parts[0].capitalize()} vs {parts[1].capitalize()}")
+    return sorted(names)
+
+
 
 # ─────────────────────────────────────────────
 #  SERIAL WORKER
@@ -264,14 +316,7 @@ class ButtonMap(QWidget):
         self.ctr.setStyleSheet(self._active(C["warning"]))
         QTimer.singleShot(600, lambda: self.ctr.setStyleSheet(self._idle()))
 
-# ─────────────────────────────────────────────
-#  MATPLOTLIB CHART
-# ─────────────────────────────────────────────
-class Chart(FigureCanvas):
-    def __init__(self):
-        self.fig = Figure(figsize=(5, 3.2), facecolor=C["surface"])
-        super().__init__(self.fig)
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+
 
 # ─────────────────────────────────────────────
 #  COUNTDOWN DISPLAY  (separate widget so it
@@ -308,149 +353,168 @@ class StatsTab(QWidget):
         super().__init__()
         root = QVBoxLayout(self)
         root.setContentsMargins(12, 12, 12, 12)
-        root.setSpacing(8)
+        root.setSpacing(10)
 
+        # Matchup selector
         ctrl = QHBoxLayout()
-        ctrl.addWidget(lbl("Player:", 11, C["muted"]))
-        self.p_cb = QComboBox(); self.p_cb.setMinimumWidth(150)
-        ctrl.addWidget(self.p_cb)
-        ctrl.addSpacing(14)
-        ctrl.addWidget(lbl("vs:", 11, C["muted"]))
-        self.o_cb = QComboBox(); self.o_cb.setMinimumWidth(150)
-        self.o_cb.addItem("All opponents")
-        ctrl.addWidget(self.o_cb)
+        ctrl.addWidget(lbl("Matchup:", 11, C["muted"]))
+        self.m_cb = QComboBox(); self.m_cb.setMinimumWidth(200)
+        ctrl.addWidget(self.m_cb)
         ctrl.addStretch()
         rb = QPushButton("REFRESH"); rb.clicked.connect(self.refresh)
         ctrl.addWidget(rb)
         root.addLayout(ctrl)
 
-        row = QHBoxLayout()
-        lb  = QGroupBox("Reaction time over rounds (ms)")
-        ll  = QVBoxLayout(lb)
-        self.rt_ch = Chart(); ll.addWidget(self.rt_ch)
-        row.addWidget(lb)
-        rb2 = QGroupBox("Win rate vs opponents (%)")
-        rl  = QVBoxLayout(rb2)
-        self.wr_ch = Chart(); rl.addWidget(self.wr_ch)
-        row.addWidget(rb2)
-        root.addLayout(row)
+        # Persistent score display
+        score_box = QGroupBox("Persistent scores  (winner +1 / loser −1, floor 0)")
+        score_lay = QHBoxLayout(score_box)
+        self.p1_score_name = lbl("P1", 13, C["p1"], bold=True)
+        self.p1_score_name.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.p1_score_val  = BigNum("0", C["p1"], 32)
+        self.p2_score_name = lbl("P2", 13, C["p2"], bold=True)
+        self.p2_score_name.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.p2_score_val  = BigNum("0", C["p2"], 32)
+        vs_lbl = lbl("VS", 13, C["muted"], bold=True)
+        vs_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        pv1 = QVBoxLayout(); pv1.addWidget(self.p1_score_name); pv1.addWidget(self.p1_score_val)
+        pv2 = QVBoxLayout(); pv2.addWidget(self.p2_score_name); pv2.addWidget(self.p2_score_val)
+        score_lay.addLayout(pv1)
+        score_lay.addWidget(vs_lbl)
+        score_lay.addLayout(pv2)
+        root.addWidget(score_box)
 
-        self.summary = lbl("Select a player and press REFRESH.", 11, C["muted"])
+        # Game history table
+        hist_box = QGroupBox("Game history")
+        hist_lay = QVBoxLayout(hist_box)
+
+        # Table header
+        hdr = QHBoxLayout()
+        for text, width in [("Game", 60), ("Winner", 120),
+                             ("P1 reaction", 120), ("P2 reaction", 120),
+                             ("Date", 180)]:
+            h = lbl(text, 10, C["muted"], bold=True)
+            h.setFixedWidth(width)
+            hdr.addWidget(h)
+        hdr.addStretch()
+        hist_lay.addLayout(hdr)
+
+        # Divider
+        line = QWidget(); line.setFixedHeight(1)
+        line.setStyleSheet(f"background:{C['border']};")
+        hist_lay.addWidget(line)
+
+        # Scrollable rows area
+        self._scroll = QScrollArea()
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setMinimumHeight(200)
+        self._rows_widget = QWidget()
+        self._rows_layout = QVBoxLayout(self._rows_widget)
+        self._rows_layout.setSpacing(2)
+        self._rows_layout.addStretch()
+        self._scroll.setWidget(self._rows_widget)
+        hist_lay.addWidget(self._scroll)
+        root.addWidget(hist_box)
+
+        # Summary line
+        self.summary = lbl("Select a matchup and press REFRESH.", 11, C["muted"])
         self.summary.setWordWrap(True)
         root.addWidget(self.summary)
 
-        self.reload_players()
+        self.reload_matchups()
 
-    def reload_players(self):
-        cur = self.p_cb.currentText()
-        self.p_cb.clear()
-        for p in known_players():
-            self.p_cb.addItem(p)
-        idx = self.p_cb.findText(cur)
+    def reload_matchups(self):
+        cur = self.m_cb.currentText()
+        self.m_cb.clear()
+        for m in known_matchups():
+            self.m_cb.addItem(m)
+        idx = self.m_cb.findText(cur)
         if idx >= 0:
-            self.p_cb.setCurrentIndex(idx)
+            self.m_cb.setCurrentIndex(idx)
 
-    def add_opponent(self, name: str):
-        if self.o_cb.findText(name) < 0:
-            self.o_cb.addItem(name)
+    def add_matchup(self, a: str, b: str):
+        label = f"{a.capitalize()} vs {b.capitalize()}"
+        if self.m_cb.findText(label) < 0:
+            self.m_cb.addItem(label)
 
     def refresh(self):
-        self.reload_players()
-        player = self.p_cb.currentText()
-        if not player:
+        self.reload_matchups()
+        matchup = self.m_cb.currentText()
+        if not matchup or " vs " not in matchup:
             return
-        rows = load_player(player)
-        opp_f = self.o_cb.currentText()
-        if opp_f != "All opponents":
-            rows = [r for r in rows if r["opponent"].lower() == opp_f.lower()]
 
-        # ── Reaction time chart ──────────────────────────────────────────────
-        self.rt_ch.fig.clear()
-        ax = self.rt_ch.fig.add_subplot(111, facecolor=C["surface2"])
-        self._sax(ax)
+        parts = matchup.split(" vs ")
+        a, b  = parts[0].strip(), parts[1].strip()
 
-        rts = []
-        for r in rows:
-            v = r.get("reaction_ms", "0")
-            try:
-                iv = int(v)
-                if iv > 0:
-                    rts.append(iv)
-            except ValueError:
-                pass
+        # ── Scores — calculated fresh from CSV, no JSON needed ───────────────
+        a_score, b_score = calc_scores(a, b)
+        self.p1_score_name.setText(a)
+        self.p2_score_name.setText(b)
+        self.p1_score_val.set_val(str(a_score))
+        self.p2_score_val.set_val(str(b_score))
 
-        if rts:
-            xs = list(range(1, len(rts)+1))
-            ax.plot(xs, rts, color=C["p1"], lw=1.5,
-                    marker="o", ms=4, markerfacecolor=C["accent"])
-            if len(rts) >= 5:
-                roll = [statistics.mean(rts[max(0,i-4):i+1]) for i in range(len(rts))]
-                ax.plot(xs, roll, color=C["warning"], lw=1,
-                        linestyle="--", label="5-round avg")
-                ax.legend(facecolor=C["surface"], edgecolor=C["border"],
-                          labelcolor=C["muted"], fontsize=8)
-            ax.set_xlabel("Round", color=C["muted"], fontsize=9)
-            ax.set_ylabel("ms",    color=C["muted"], fontsize=9)
-            ax.set_title(f"{player} – reaction history",
-                         color=C["text"], fontsize=10, pad=6)
-        else:
-            ax.text(0.5, 0.5, "No reaction data", ha="center", va="center",
-                    color=C["muted"], transform=ax.transAxes)
+        # ── Game history rows ─────────────────────────────────────────────────
+        games = load_matchup(a, b)
 
-        self.rt_ch.fig.tight_layout(pad=1.2)
-        self.rt_ch.draw()
+        # Clear existing rows
+        while self._rows_layout.count() > 1:  # keep the stretch at end
+            item = self._rows_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
 
-        # ── Win rate chart ───────────────────────────────────────────────────
-        self.wr_ch.fig.clear()
-        ax2 = self.wr_ch.fig.add_subplot(111, facecolor=C["surface2"])
-        self._sax(ax2)
+        p1_rts, p2_rts = [], []
+        a_wins = b_wins = 0
 
-        wins_by  = defaultdict(int)
-        total_by = defaultdict(int)
-        for r in rows:
-            o = r.get("opponent", "?")
-            total_by[o] += 1
-            if r.get("result") == "win":
-                wins_by[o] += 1
+        for i, g in enumerate(games, 1):
+            winner  = g.get("winner", "?")
+            p1rt_s  = g.get("p1_reaction_ms", "0")
+            p2rt_s  = g.get("p2_reaction_ms", "0")
+            ts      = g.get("timestamp", "")[:19]  # trim to seconds
 
-        if total_by:
-            opps  = list(total_by)
-            rates = [100 * wins_by[o] / total_by[o] for o in opps]
-            cols  = [C["success"] if r >= 50 else C["danger"] for r in rates]
-            bars  = ax2.bar(opps, rates, color=cols,
-                            edgecolor=C["border"], lw=0.5, width=0.5)
-            ax2.set_ylim(0, 110)
-            ax2.axhline(50, color=C["muted"], lw=0.8, linestyle="--")
-            for b, r in zip(bars, rates):
-                ax2.text(b.get_x()+b.get_width()/2, b.get_height()+2,
-                         f"{r:.0f}%", ha="center", va="bottom",
-                         color=C["text"], fontsize=8)
-            ax2.set_ylabel("%", color=C["muted"], fontsize=9)
-            ax2.set_title(f"{player} – win rates",
-                          color=C["text"], fontsize=10, pad=6)
-        else:
-            ax2.text(0.5, 0.5, "No data", ha="center", va="center",
-                     color=C["muted"], transform=ax2.transAxes)
+            try: p1rt = int(p1rt_s)
+            except ValueError: p1rt = 0
+            try: p2rt = int(p2rt_s)
+            except ValueError: p2rt = 0
 
-        self.wr_ch.fig.tight_layout(pad=1.2)
-        self.wr_ch.draw()
+            if p1rt > 0: p1_rts.append(p1rt)
+            if p2rt > 0: p2_rts.append(p2rt)
+            if winner.lower() == a.lower(): a_wins += 1
+            elif winner.lower() == b.lower(): b_wins += 1
 
-        # ── Summary ──────────────────────────────────────────────────────────
-        total = len(rows)
-        wins  = sum(1 for r in rows if r.get("result") == "win")
-        avg   = int(statistics.mean(rts)) if rts else 0
-        best  = min(rts) if rts else 0
+            # Colour the row by winner
+            row_color = C["p1"] if winner.lower() == a.lower() else C["p2"]
+
+            row = QHBoxLayout()
+            for text, width in [
+                (str(i),                         60),
+                (winner,                        120),
+                (f"{p1rt}ms" if p1rt else "—", 120),
+                (f"{p2rt}ms" if p2rt else "—", 120),
+                (ts,                            180),
+            ]:
+                cell = lbl(text, 11, row_color if text == winner else C["text"])
+                cell.setFixedWidth(width)
+                row.addWidget(cell)
+            row.addStretch()
+
+            container = QWidget()
+            container.setLayout(row)
+            container.setStyleSheet(
+                f"background:{C['surface2']}; border-radius:4px; padding:2px;")
+            self._rows_layout.insertWidget(self._rows_layout.count()-1, container)
+
+        if not games:
+            self._rows_layout.insertWidget(
+                0, lbl("No games played yet.", 11, C["muted"]))
+
+        # ── Summary ───────────────────────────────────────────────────────────
+        total = len(games)
+        avg1  = int(statistics.mean(p1_rts)) if p1_rts else 0
+        avg2  = int(statistics.mean(p2_rts)) if p2_rts else 0
         self.summary.setText(
-            f"  {player}  ·  {total} rounds  ·  "
-            f"{wins} wins ({100*wins//max(total,1)}%)  ·  "
-            f"avg {avg} ms  ·  best {best} ms"
+            f"  {a} vs {b}  ·  {total} games played  ·  "
+            f"{a}: {a_wins} wins, avg {avg1}ms  ·  "
+            f"{b}: {b_wins} wins, avg {avg2}ms"
         )
-
-    @staticmethod
-    def _sax(ax):
-        ax.tick_params(colors=C["muted"], labelsize=8)
-        for sp in ax.spines.values():
-            sp.set_edgecolor(C["border"])
 
 # ─────────────────────────────────────────────
 #  GAME TAB
@@ -467,6 +531,8 @@ class GameTab(QWidget):
         self.rnd = self.samples = 0
         self.session = ""
         self.active  = False
+        self.last_p1rt = 0   # last valid reaction time in ms — saved at game over
+        self.last_p2rt = 0
         self._build()
 
     # ── BUILD UI ─────────────────────────────────────────────────────────────
@@ -715,25 +781,18 @@ class GameTab(QWidget):
                     if p1ms > 0:
                         self.rt1.set_val(f"{p1ms}ms")
                         self.rt1.flash()
+                        self.last_p1rt = p1ms   # store as int for game-over save
                     if p2ms > 0:
                         self.rt2.set_val(f"{p2ms}ms")
                         self.rt2.flash()
+                        self.last_p2rt = p2ms   # store as int for game-over save
 
                     # Button map flash for winner
                     if winner in ("1", "2"):
                         self.bmap.highlight(int(winner))
 
-                    # Save to CSV only for real scored rounds
-                    if winner not in ("NONE", "0", ""):
-                        res1 = "win" if winner == "1" else "loss"
-                        res2 = "win" if winner == "2" else "loss"
-                        save_round(self.p1, self.p2, self.rnd,
-                                   max(p1ms, 0), res1,
-                                   self.p1w, self.p2w, self.session)
-                        save_round(self.p2, self.p1, self.rnd,
-                                   max(p2ms, 0), res2,
-                                   self.p2w, self.p1w, self.session)
-                        self.round_done.emit(self.p1, self.p2)
+                    # CSV is saved per GAME at GAME_OVER, not per round
+                    self.round_done.emit(self.p1, self.p2)
 
                     self._set_state("ROUND DONE", C["accent"])
                 else:
@@ -752,11 +811,24 @@ class GameTab(QWidget):
             self.start_btn.setEnabled(True)
             self.stop_btn.setEnabled(False)
             self.active = False
+
+            # Save game record and update persistent scores
+            # Use stored integer values — not label text which may be "---"
+            save_game(self.p1, self.p2, wname,
+                      self.last_p1rt, self.last_p2rt, self.session)
+            a_score, b_score = calc_scores(self.p1, self.p2)
+            p1_sc = a_score if _safe(self.p1) <= _safe(self.p2) else b_score
+            p2_sc = b_score if _safe(self.p1) <= _safe(self.p2) else a_score
+
+            self.round_done.emit(self.p1, self.p2)
+
             QMessageBox.information(
                 self, "Game Over",
                 f"  {wname} wins the game!\n\n"
-                f"{self.p1}: {self.p1w} wins\n"
-                f"{self.p2}: {self.p2w} wins"
+                f"{self.p1}: {self.p1w} round wins\n"
+                f"{self.p2}: {self.p2w} round wins\n\n"
+                f"── Persistent scores ──\n"
+                f"{self.p1}: {p1_sc}  |  {self.p2}: {p2_sc}"
             )
 
     # ── GAME CONTROL ─────────────────────────────────────────────────────────
@@ -766,6 +838,8 @@ class GameTab(QWidget):
         self.p1nl.setText(self.p1); self.p2nl.setText(self.p2)
         self.p1w = self.p2w = 0
         self.rnd = self.samples = 0
+        self.last_p1rt = 0
+        self.last_p2rt = 0
         self.session = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.sc1.set_val("0"); self.sc2.set_val("0")
         self.r_num.set_val("0"); self.s_num.set_val("0")
@@ -829,12 +903,11 @@ class MainWindow(QMainWindow):
         vl.addWidget(self.tabs)
 
         self.tabs.currentChanged.connect(
-            lambda i: self.stat.reload_players() if i == 1 else None)
+            lambda i: self.stat.reload_matchups() if i == 1 else None)
         self.game.round_done.connect(self._after_round)
 
     def _after_round(self, p1: str, p2: str):
-        self.stat.add_opponent(p1)
-        self.stat.add_opponent(p2)
+        self.stat.add_matchup(p1, p2)
 
 # ─────────────────────────────────────────────
 #  ENTRY POINT
